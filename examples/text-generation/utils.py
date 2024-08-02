@@ -148,10 +148,11 @@ def setup_env(args):
         # we can call HPU graphs clear_inputs().
         os.environ.setdefault("PT_HPUGRAPH_DISABLE_TENSOR_CACHE", "1")
 
-    # Tweak generation so that it runs faster on Gaudi
-    from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+    if not args.disable_optimum:
+        # Tweak generation so that it runs faster on Gaudi
+        from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
 
-    adapt_transformers_to_gaudi()
+        adapt_transformers_to_gaudi()
 
 
 def setup_device(args):

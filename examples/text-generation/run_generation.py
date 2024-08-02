@@ -31,7 +31,10 @@ import torch
 from utils import adjust_batch, count_hpu_graphs, finalize_quantization, initialize_model
 
 from optimum.habana.utils import get_hpu_memory_stats
+from transformers import StoppingCriteria, StoppingCriteriaList
 
+from typing import List
+import copy
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -46,9 +49,9 @@ def setup_parser(parser):
     parser.add_argument("--device", "-d", type=str, choices=["hpu"], help="Device to run", default="hpu")
     parser.add_argument(
         "--model_name_or_path",
-        default=None,
+        default="/workspace/src/ckpt/pretrained_ckpt/vicuna_ckpt/7b_v0",
         type=str,
-        required=True,
+        #required=True,
         help="Path to pre-trained model (on the HF Hub or locally).",
     )
     parser.add_argument(
@@ -277,7 +280,7 @@ def setup_parser(parser):
     )
     parser.add_argument(
         "--ignore_eos",
-        default=True,
+        default=False,
         action=argparse.BooleanOptionalAction,
         help="Whether to disable stopping with eos token when calling `generate`. --no-ignore_eos to disable it",
     )
@@ -311,6 +314,21 @@ def setup_parser(parser):
         default="none",
         help="Run multi card with the specified parallel strategy. Choices are 'tp' for Tensor Parallel Strategy or 'none'.",
     )
+    parser.add_argument(
+        "--disable_optimum",
+        action="store_true",
+        help="Whether to use optimum habana.",
+    )
+    parser.add_argument(
+        "--use_embeds",
+        action="store_true",
+        help="Whether to enable inputs_embeds or not.",
+    )
+    parser.add_argument(
+        "--static_shapes",
+        action="store_true",
+        help="Whether to set static_shapes or not.",
+    )
 
     args = parser.parse_args()
 
@@ -329,6 +347,47 @@ def setup_parser(parser):
             "`--disk_offload` was tested only with fp8, it may not work with full precision. If error raises try to remove the --disk_offload flag."
         )
     return args
+
+
+class StoppingCriteriaSub(StoppingCriteria):
+
+    def __init__(self, stops: List = None, encounters: int = 1):
+        super().__init__()
+        self.stops = stops
+        self.ENCOUNTERS = encounters
+
+    def __call__(self, input_ids: torch.LongTensor,
+                 scores: torch.FloatTensor,
+                 token_id=None,
+                 ignore_eos=None,
+                 eos_token_id=None,
+                 **kwargs):
+        stop_count = 0
+        for stop in self.stops:
+            _stop = torch.tensor(stop).to(input_ids[0].device)
+            indices = torch.where(_stop[0] == input_ids)
+            for i in indices:
+                if len(i) > 0:
+                    if torch.all(input_ids[0][i:i + len(_stop)] == _stop):
+                        stop_count += 1
+        if stop_count >= self.ENCOUNTERS:
+            print(f"====================== StoppingCriteria input_ids:{input_ids}")
+            return torch.tensor([True]) if 'needs_tensor_output' in kwargs and kwargs['needs_tensor_output'] else True
+        return torch.tensor([False]) if 'needs_tensor_output' in kwargs and kwargs['needs_tensor_output'] else False
+
+def prepare_generation_embedding(model, input_tokens):
+    logger.info("prepare_generation_embedding.")
+
+    batch_size = input_tokens['input_ids'].size(0)
+
+    # Get text embeddings from the model
+    inputs_embeds = model.model.embed_tokens(input_tokens['input_ids'])
+
+    # If you need to expand the embeddings for the batch size
+    if inputs_embeds.size(0) != batch_size:
+        inputs_embeds = inputs_embeds.expand(batch_size, -1, -1)
+
+    return inputs_embeds
 
 
 def main():
@@ -405,6 +464,24 @@ def main():
         elif args.batch_size < len(input_sentences):
             input_sentences = input_sentences[: args.batch_size]
 
+        model_kwargs = {}
+        iteration_times = [0] * (args.warmup + args.n_iterations)
+        logger.info(f"Current configuration: disable_optimum:{args.disable_optimum}, use_embeds:{args.use_embeds}")
+        if not args.disable_optimum:
+            stopping_criteria = StoppingCriteriaList([StoppingCriteriaSub(stops=[[835], [2277, 29937]], encounters=1)])
+            model_kwargs.update({
+                'lazy_mode': True,
+                'hpu_graphs': args.use_hpu_graphs,
+                'profiling_steps': args.profiling_steps,
+                'profiling_warmup_steps': args.profiling_warmup_steps,
+                'ignore_eos': args.ignore_eos,
+                'iteration_times': iteration_times,
+                'profiling_record_shapes': args.profiling_record_shapes,
+                'stopping_criteria': stopping_criteria,
+            })
+            generation_config = copy.deepcopy(model.generation_config)
+            generation_config.static_shapes = args.static_shapes
+
         def generate(size=None, reduce_recompile=False):
             """Generates sequences from the input sentences and returns them."""
             encode_t0 = time.perf_counter()
@@ -428,18 +505,17 @@ def main():
                 for t in input_tokens:
                     if torch.is_tensor(input_tokens[t]):
                         input_tokens[t] = input_tokens[t].to(args.device)
-            iteration_times = []
+
+            if args.use_embeds:
+                inputs_embeds = prepare_generation_embedding(model, input_tokens)
+                model_kwargs['inputs_embeds'] = inputs_embeds
+            else:
+                model_kwargs.update(input_tokens)
+
             outputs = model.generate(
-                **input_tokens,
+                **model_kwargs,
                 generation_config=generation_config,
                 assistant_model=assistant_model,
-                lazy_mode=use_lazy_mode,
-                hpu_graphs=args.use_hpu_graphs,
-                profiling_steps=args.profiling_steps,
-                profiling_warmup_steps=args.profiling_warmup_steps,
-                ignore_eos=args.ignore_eos,
-                iteration_times=iteration_times,
-                profiling_record_shapes=args.profiling_record_shapes,
             ).cpu()
             first_token_time = iteration_times[0] + encode_duration
             logger.info(f"Time to first token = {first_token_time*1000}ms")
@@ -519,7 +595,10 @@ def main():
             with (output_dir / "results.json").open("w", encoding="utf-8") as f:
                 json.dump(results, f, ensure_ascii=False, indent=4)
 
-        stats = f"Throughput (including tokenization) = {throughput} tokens/second"
+        stats = f"Use Huggingface Transformers Model" if args.disable_optimum else "Use Optimum-habana Model"
+        stats = stats + f"\nInput embeds" if args.use_embeds else stats + "\nInput tokens"
+        stats = stats + f"\nStatic shapes: True" if generation_config.static_shapes else stats + f"\nStatic shapes: False"
+        stats = stats + f"\nThroughput (including tokenization) = {throughput} tokens/second"
         stats = stats + f"\nNumber of HPU graphs                = {count_hpu_graphs()}"
         separator = "-" * len(stats)
         print()
