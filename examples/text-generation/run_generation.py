@@ -477,7 +477,7 @@ def main():
                 'ignore_eos': args.ignore_eos,
                 'iteration_times': iteration_times,
                 'profiling_record_shapes': args.profiling_record_shapes,
-                'stopping_criteria': stopping_criteria,
+                #'stopping_criteria': stopping_criteria,
             })
             generation_config = copy.deepcopy(model.generation_config)
             generation_config.static_shapes = args.static_shapes
