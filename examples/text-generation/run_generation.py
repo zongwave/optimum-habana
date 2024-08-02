@@ -311,6 +311,11 @@ def setup_parser(parser):
         default="none",
         help="Run multi card with the specified parallel strategy. Choices are 'tp' for Tensor Parallel Strategy or 'none'.",
     )
+    parser.add_argument(
+        "--use_embeds",
+        action="store_true",
+        help="Whether to enable inputs_embeds or not.",
+    )
 
     args = parser.parse_args()
 
@@ -329,6 +334,27 @@ def setup_parser(parser):
             "`--disk_offload` was tested only with fp8, it may not work with full precision. If error raises try to remove the --disk_offload flag."
         )
     return args
+
+
+def prepare_generation_embedding(model, model_name, input_tokens):
+    batch_size = input_tokens['input_ids'].size(0)
+
+    # Get text embeddings from the model
+    if model_name == "meta-llama/Llama-2-7b-hf":
+        inputs_embeds = model.model.embed_tokens(input_tokens['input_ids'])
+    if model_name == "gpt2":
+        inputs_embeds = model.transformer.wte(input_tokens['input_ids'])
+    elif model_name == "tiiuae/falcon-7b":
+        inputs_embeds = model.transformer.word_embeddings(input_tokens['input_ids'])
+    else:
+        logger.warning(f"This test does not support input embeds for model: {model_name}")
+        return None
+
+    # If you need to expand the embeddings for the batch size
+    if inputs_embeds.size(0) != batch_size:
+        inputs_embeds = inputs_embeds.expand(batch_size, -1, -1)
+
+    return inputs_embeds
 
 
 def main():
@@ -428,9 +454,21 @@ def main():
                 for t in input_tokens:
                     if torch.is_tensor(input_tokens[t]):
                         input_tokens[t] = input_tokens[t].to(args.device)
+
+            input_data = {}
+            if args.use_embeds:
+                inputs_embeds = prepare_generation_embedding(model, args.model_name_or_path, input_tokens)
+                if inputs_embeds is not None:
+                    input_data['inputs_embeds'] = inputs_embeds
+                else:
+                    args.use_embeds = False
+                    input_data.update(input_tokens)
+            else:
+                input_data.update(input_tokens)
+
             iteration_times = []
             outputs = model.generate(
-                **input_tokens,
+                **input_data,
                 generation_config=generation_config,
                 assistant_model=assistant_model,
                 lazy_mode=use_lazy_mode,
@@ -519,7 +557,8 @@ def main():
             with (output_dir / "results.json").open("w", encoding="utf-8") as f:
                 json.dump(results, f, ensure_ascii=False, indent=4)
 
-        stats = f"Throughput (including tokenization) = {throughput} tokens/second"
+        stats = f"Input embeds" if args.use_embeds else "Input tokens"
+        stats = stats + f"\nThroughput (including tokenization) = {throughput} tokens/second"
         stats = stats + f"\nNumber of HPU graphs                = {count_hpu_graphs()}"
         separator = "-" * len(stats)
         print()
