@@ -1061,7 +1061,7 @@ class GaudiLlamaModel(LlamaModel):
             use_cache = False
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
         ignore_cache_position = True  # Ignoring cache position for HPU
         use_new_cache = False  # Ignoring new Cache path for HPU

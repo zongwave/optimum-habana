@@ -36,6 +36,7 @@ from .models import (
     GaudiCLIPVisionEmbeddings,
     GaudiCLIPVisionModel,
     GaudiCLIPVisionTransformer,
+    GaudiCLIPTextTransformer,
     GaudiCodeGenAttention,
     GaudiCodeGenForCausalLM,
     GaudiFalconAttention,
@@ -387,6 +388,7 @@ def adapt_transformers_to_gaudi():
     transformers.models.clip.modeling_clip.CLIPEncoder = GaudiCLIPEncoder
     transformers.models.clip.modeling_clip.CLIPVisionTransformer = GaudiCLIPVisionTransformer
     transformers.models.clip.modeling_clip.CLIPVisionModel = GaudiCLIPVisionModel
+    transformers.models.clip.modeling_clip.CLIPTextTransformer = GaudiCLIPTextTransformer
 
     # Optimization for falcon generation on Gaudi
     transformers.models.falcon.modeling_falcon.FalconAttention = GaudiFalconAttention

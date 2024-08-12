@@ -5,4 +5,5 @@ from .modeling_clip import (
     GaudiCLIPVisionEmbeddings,
     GaudiCLIPVisionModel,
     GaudiCLIPVisionTransformer,
+    GaudiCLIPTextTransformer,
 )

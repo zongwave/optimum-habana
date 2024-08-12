@@ -38,6 +38,7 @@ from .clip import (
     GaudiCLIPVisionEmbeddings,
     GaudiCLIPVisionModel,
     GaudiCLIPVisionTransformer,
+    GaudiCLIPTextTransformer,
 )
 from .codegen import (
     GaudiCodeGenAttention,
