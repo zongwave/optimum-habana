@@ -540,7 +540,7 @@ class GaudiGenerationMixin(GenerationMixin):
                     "Please refer to the documentation for more information. "
                     "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
                 )
-            if has_token_idx:
+            if has_token_idx and input_ids_length > 0:
                 generation_config.max_length = input_ids_length
             else:
                 generation_config.max_length = generation_config.max_new_tokens + input_ids_length
@@ -865,6 +865,7 @@ class GaudiGenerationMixin(GenerationMixin):
             else:
                 assert generation_config.bucket_size >= 0, "please set valid bucket_size to use bucket_internal"
 
+        print(f"L868 =============== GaudiGenerationMixin static_shapes:{generation_config.static_shapes}, model_input_name:{model_input_name}")
         if generation_config.static_shapes:
             # Pad inputs to have static shapes during generation, this gives better performance than dynamic shapes on HPUs
             # In encoder_decoder models, Inputs are already padded
@@ -873,14 +874,22 @@ class GaudiGenerationMixin(GenerationMixin):
                 # only pad if bucket_size < -1. If we are bucketing (bucket_size > 0), then that is taken care in greedy_search()
                 if not is_greedy_or_beam_and_bucket:
                     # token_idx is the current index in the generation process, it is incremented each time a new token is generated
-                    token_idx = inputs_tensor.shape[-1]
+                    token_idx = inputs_tensor.shape[1]
                     model_kwargs["token_idx"] = torch.tensor(token_idx, device=inputs_tensor.device)
                     model_kwargs["token_idx_cpu"] = token_idx
                     if generation_config.max_new_tokens is None:
                         generation_config.max_new_tokens = generation_config.max_length - token_idx
-                    inputs_tensor = torch.nn.functional.pad(
-                        inputs_tensor, (0, generation_config.max_new_tokens), value=generation_config.pad_token_id
-                    )
+                    if model_input_name == "inputs_embeds" and model_kwargs.get("inputs_embeds") is not None:
+                        inputs_tensor = torch.nn.functional.pad(
+                            inputs_tensor, (0, 0, 0, generation_config.max_new_tokens), value=generation_config.pad_token_id
+                        )
+                        model_kwargs["inputs_embeds"] = torch.nn.functional.pad(
+                            model_kwargs["inputs_embeds"], (0, 0, 0, generation_config.max_new_tokens), value=0
+                        )
+                    else:
+                        inputs_tensor = torch.nn.functional.pad(
+                            inputs_tensor, (0, generation_config.max_new_tokens), value=generation_config.pad_token_id
+                        )
                     for other_inputs in ["attention_mask", "token_type_ids"]:
                         if model_kwargs.get(other_inputs) is not None:
                             model_kwargs[other_inputs] = torch.nn.functional.pad(
@@ -939,12 +948,16 @@ class GaudiGenerationMixin(GenerationMixin):
             )
         else:
             input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+            if (model_input_name == "inputs_embeds" and generation_config.static_shapes):
+                input_ids = torch.nn.functional.pad(
+                    input_ids, (0, generation_config.max_new_tokens), value=generation_config.pad_token_id
+                )
 
         if streamer is not None:
             streamer.put(input_ids.cpu())
 
         # 6. Prepare `max_length` depending on other stopping criteria.
-        input_ids_length = input_ids.shape[-1]
+        input_ids_length = input_ids.shape[1]
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
         has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
         generation_config = self._prepare_generated_length(
@@ -1860,7 +1873,11 @@ class GaudiGenerationMixin(GenerationMixin):
                 )
             else:
                 unfinished_sequences = unfinished_sequences & ~stopping_criteria(
-                    input_ids, scores, token_idx=cur_len, ignore_eos=ignore_eos, eos_token_id=eos_token_id
+                    input_ids,
+                    scores,
+                    token_idx=None if "inputs_embeds" in model_kwargs else cur_len,
+                    ignore_eos=ignore_eos,
+                    eos_token_id=eos_token_id
                 )
                 this_peer_finished = unfinished_sequences.max() == 0
             hb_profer.step()
@@ -2138,6 +2155,7 @@ class GaudiGenerationMixin(GenerationMixin):
 
         # keep track of which sequences are already finished
         # TODO: no ignore_eos check here since there is a compilation error, will add ignore_eos here if fixed
+        # @ZONGWAVE need to input_ids.shape[:2] ?
         batch_size, cur_len = input_ids.shape
         if "inputs_embeds" in model_kwargs:
             cur_len = model_kwargs["inputs_embeds"].shape[1]

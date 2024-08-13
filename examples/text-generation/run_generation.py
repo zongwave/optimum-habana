@@ -31,7 +31,9 @@ import torch
 from utils import adjust_batch, count_hpu_graphs, initialize_model
 
 from optimum.habana.utils import get_hpu_memory_stats
+from transformers import StoppingCriteria, StoppingCriteriaList
 
+from typing import List
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -40,15 +42,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+default_model_path="/workspace/src/ckpt/pretrained_ckpt/vicuna_ckpt/7b_v0"
 def setup_parser(parser):
     # Arguments management
     parser.add_argument("--device", "-d", type=str, choices=["hpu"], help="Device to run", default="hpu")
     parser.add_argument(
         "--model_name_or_path",
-        default=None,
+        default=default_model_path,
         type=str,
-        required=True,
+        #required=True,
         help="Path to pre-trained model (on the HF Hub or locally).",
     )
     parser.add_argument(
@@ -287,6 +289,24 @@ def setup_parser(parser):
         action="store_true",
         help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
     )
+
+    parser.add_argument(
+        "--disable_optimum",
+        action="store_true",
+        help="Whether to use optimum habana.",
+    )
+    parser.add_argument(
+        "--use_embeds",
+        action="store_true",
+        help="Whether to enable inputs_embeds or not.",
+    )
+    parser.add_argument(
+        "--static_shapes",
+        action="store_true",
+        help="Whether to set static_shapes or not.",
+    )
+    parser.add_argument("--config_set", default=0, type=int, help="Generation Mixin config set")
+
     args = parser.parse_args()
 
     if args.torch_compile:
@@ -302,11 +322,75 @@ def setup_parser(parser):
         )
     return args
 
+class StoppingCriteriaSub(StoppingCriteria):
+
+    def __init__(self, stops: List = None, encounters: int = 1):
+        super().__init__()
+        self.stops = stops
+        self.ENCOUNTERS = encounters
+
+    def __call__(self, input_ids: torch.LongTensor,
+                 scores: torch.FloatTensor,
+                 token_id=None,
+                 ignore_eos=None,
+                 eos_token_id=None,
+                 **kwargs):
+        stop_count = 0
+        for stop in self.stops:
+            _stop = torch.tensor(stop).to(input_ids[0].device)
+            indices = torch.where(_stop[0] == input_ids)
+            for i in indices:
+                if len(i) > 0:
+                    if torch.all(input_ids[0][i:i + len(_stop)] == _stop):
+                        stop_count += 1
+        if stop_count >= self.ENCOUNTERS:
+            return torch.tensor([True]) if 'needs_tensor_output' in kwargs and kwargs['needs_tensor_output'] else True
+        return torch.tensor([False]) if 'needs_tensor_output' in kwargs and kwargs['needs_tensor_output'] else False
+
+def prepare_generation_embedding(model, model_name, input_tokens):
+    batch_size = input_tokens['input_ids'].size(0)
+
+    # Get text embeddings from the model
+    if model_name == default_model_path:
+        inputs_embeds = model.model.embed_tokens(input_tokens['input_ids'])
+    elif model_name == "meta-llama/Llama-2-7b-hf":
+        inputs_embeds = model.model.embed_tokens(input_tokens['input_ids'])
+    elif model_name == "gpt2":
+        inputs_embeds = model.transformer.wte(input_tokens['input_ids'])
+    elif model_name == "tiiuae/falcon-7b":
+        inputs_embeds = model.transformer.word_embeddings(input_tokens['input_ids'])
+    else:
+        logger.warning(f"This test does not support input embeds for model: {model_name}")
+        return None
+
+    # If you need to expand the embeddings for the batch size
+    if inputs_embeds.size(0) != batch_size:
+        inputs_embeds = inputs_embeds.expand(batch_size, -1, -1)
+
+    return inputs_embeds
+
 
 def main():
     parser = argparse.ArgumentParser()
     args = setup_parser(parser)
     model, assistant_model, tokenizer, generation_config = initialize_model(args, logger)
+    generation_config.static_shapes = args.static_shapes
+
+    # Define different generation configurations
+    # https://huggingface.co/docs/transformers/en/main_classes/text_generation#transformers.GenerationMixin
+    mixin_configs = [
+        {"num_beams": 1, "do_sample": False},  # Greedy decoding
+        {"penalty_alpha": 0.1, "top_k": 5},  # Contrastive search
+        {"num_beams": 1, "do_sample": True},  # Multinomial sampling GPT2
+        {"num_beams": 5, "do_sample": False},  # Beam-search decoding GPT2
+        {"num_beams": 5, "do_sample": True},  # Beam-search multinomial sampling GPT2
+        {"num_beams": 5, "num_beam_groups": 1, "diversity_penalty": 0},  # Diverse beam-search decoding GPT2
+    ]
+
+    selected_config = mixin_configs[args.config_set]
+    for key, value in selected_config.items():
+        setattr(generation_config, key, value)
+    print(f"Testing configuration: {generation_config}")
 
     use_lazy_mode = True
     if args.torch_compile and model.config.model_type == "llama":
@@ -377,6 +461,22 @@ def main():
         elif args.batch_size < len(input_sentences):
             input_sentences = input_sentences[: args.batch_size]
 
+        model_kwargs = {}
+        iteration_times = [0] * (args.warmup + args.n_iterations)
+        logger.info(f"Current configuration: disable_optimum:{args.disable_optimum}, use_embeds:{args.use_embeds}")
+        if not args.disable_optimum:
+            stopping_criteria = StoppingCriteriaList([StoppingCriteriaSub(stops=[[835], [2277, 29937]], encounters=1)])
+            model_kwargs.update({
+                'lazy_mode': True,
+                'hpu_graphs': args.use_hpu_graphs,
+                'profiling_steps': args.profiling_steps,
+                'profiling_warmup_steps': args.profiling_warmup_steps,
+                'ignore_eos': args.ignore_eos,
+                'iteration_times': iteration_times,
+                'profiling_record_shapes': args.profiling_record_shapes,
+                #'stopping_criteria': stopping_criteria,
+            })
+
         def generate(size=None, reduce_recompile=False):
             """Generates sequences from the input sentences and returns them."""
             encode_t0 = time.perf_counter()
@@ -400,18 +500,17 @@ def main():
                 for t in input_tokens:
                     if torch.is_tensor(input_tokens[t]):
                         input_tokens[t] = input_tokens[t].to(args.device)
-            iteration_times = []
+
+            if args.use_embeds:
+                inputs_embeds = prepare_generation_embedding(model, args.model_name_or_path, input_tokens)
+                model_kwargs['inputs_embeds'] = inputs_embeds
+            else:
+                model_kwargs.update(input_tokens)
+
             outputs = model.generate(
-                **input_tokens,
+                **model_kwargs,
                 generation_config=generation_config,
                 assistant_model=assistant_model,
-                lazy_mode=use_lazy_mode,
-                hpu_graphs=args.use_hpu_graphs,
-                profiling_steps=args.profiling_steps,
-                profiling_warmup_steps=args.profiling_warmup_steps,
-                ignore_eos=args.ignore_eos,
-                iteration_times=iteration_times,
-                profiling_record_shapes=args.profiling_record_shapes,
             ).cpu()
             first_token_time = iteration_times[0] + encode_duration
             logger.info(f"Time to first token = {first_token_time*1000}ms")
@@ -491,7 +590,11 @@ def main():
             with (output_dir / "results.json").open("w", encoding="utf-8") as f:
                 json.dump(results, f, ensure_ascii=False, indent=4)
 
-        stats = f"Throughput (including tokenization) = {throughput} tokens/second"
+        stats = f"Use Huggingface Transformers Model" if args.disable_optimum else "Use Optimum-habana Model"
+        stats = stats + f"\nLoda pretrained mode: {args.model_name_or_path}"
+        stats = stats + f"\nInput embeds: True" if args.use_embeds else stats + "\nInput embeds: False"
+        stats = stats + f"\nStatic shapes: True" if args.static_shapes else stats + "\nStatic shapes: False"
+        stats = stats + f"\nThroughput (including tokenization) = {throughput} tokens/second"
         stats = stats + f"\nNumber of HPU graphs                = {count_hpu_graphs()}"
         separator = "-" * len(stats)
         print()
